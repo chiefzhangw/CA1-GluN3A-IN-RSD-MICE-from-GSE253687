@@ -1,0 +1,322 @@
+#!/usr/bin/env Rscript
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(dplyr)
+  library(Matrix)
+  library(readr)
+  library(stringr)
+  library(tibble)
+  library(patchwork)
+})
+
+# ============================================================
+# Reanalysis of GSE253687 snRNA-seq data
+#
+# Reproduces the analysis described in the manuscript:
+# - reanalyze "Control WT" and "RSD WT" samples from GSE253687
+# ============================================================
+
+data_dir   <- "data/GSE253687"
+output_dir <- "results/Fig3_snRNAseq"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+save_pdf <- function(plot_obj, filename, width = 6, height = 5) {
+  ggsave(
+    filename = file.path(output_dir, filename),
+    plot = plot_obj,
+    width = width,
+    height = height,
+    units = "in",
+    device = cairo_pdf
+  )
+}
+
+find_first_existing <- function(paths) {
+  hit <- paths[file.exists(paths)]
+  if (length(hit) == 0) return(NA_character_)
+  hit[1]
+}
+
+# ---------------------------
+# 1. Load data
+# ---------------------------
+seurat_rds <- find_first_existing(c(
+  file.path(data_dir, "GSE253687_seurat.rds"),
+  file.path(data_dir, "seurat_object.rds"),
+  file.path(data_dir, "processed_seurat.rds")
+))
+
+if (!is.na(seurat_rds)) {
+  message("Loading Seurat object: ", seurat_rds)
+  seu <- readRDS(seurat_rds)
+} else {
+  message("No Seurat object detected. Trying to load 10X-like files...")
+
+  mtx_file <- find_first_existing(c(
+    file.path(data_dir, "matrix.mtx.gz"),
+    file.path(data_dir, "matrix.mtx")
+  ))
+  features_file <- find_first_existing(c(
+    file.path(data_dir, "features.tsv.gz"),
+    file.path(data_dir, "features.tsv"),
+    file.path(data_dir, "genes.tsv.gz"),
+    file.path(data_dir, "genes.tsv")
+  ))
+  barcodes_file <- find_first_existing(c(
+    file.path(data_dir, "barcodes.tsv.gz"),
+    file.path(data_dir, "barcodes.tsv")
+  ))
+  metadata_file <- find_first_existing(c(
+    file.path(data_dir, "metadata.csv"),
+    file.path(data_dir, "meta.csv"),
+    file.path(data_dir, "cell_metadata.csv")
+  ))
+
+  if (any(is.na(c(mtx_file, features_file, barcodes_file, metadata_file)))) {
+    stop("Please provide either a Seurat .rds file or matrix/features/barcodes + metadata files in data/GSE253687.")
+  }
+
+  counts <- ReadMtx(
+    mtx = mtx_file,
+    features = features_file,
+    cells = barcodes_file,
+    feature.column = 2
+  )
+
+  meta <- read_csv(metadata_file, show_col_types = FALSE)
+  barcode_col <- intersect(colnames(meta), c("barcode", "barcodes", "cell", "cell_id", "Cell"))
+  if (length(barcode_col) == 0) stop("Metadata must contain a barcode/cell column.")
+  barcode_col <- barcode_col[1]
+
+  meta <- meta %>% distinct(.data[[barcode_col]], .keep_all = TRUE)
+  rownames(meta) <- meta[[barcode_col]]
+
+  common_cells <- intersect(colnames(counts), rownames(meta))
+  counts <- counts[, common_cells]
+  meta   <- meta[common_cells, , drop = FALSE]
+
+  seu <- CreateSeuratObject(counts = counts, meta.data = meta)
+}
+
+# ---------------------------
+# 2. Standardize metadata
+# ---------------------------
+candidate_group_cols <- c("group", "sample", "condition", "orig.ident", "Group", "Condition")
+group_col <- candidate_group_cols[candidate_group_cols %in% colnames(seu@meta.data)][1]
+if (length(group_col) == 0 || is.na(group_col)) stop("Could not identify group/condition column.")
+
+seu$group_use <- seu@meta.data[[group_col]] |> as.character()
+keep_levels <- c("Control WT", "RSD WT")
+if (!any(seu$group_use %in% keep_levels)) {
+  seu$group_use <- seu$group_use |>
+    str_replace_all("^Control[_ ]?WT$", "Control WT") |>
+    str_replace_all("^RSD[_ ]?WT$", "RSD WT") |>
+    str_replace_all("^WT[_ ]?Control$", "Control WT") |>
+    str_replace_all("^WT[_ ]?RSD$", "RSD WT")
+}
+seu <- subset(seu, subset = group_use %in% keep_levels)
+seu$group_use <- factor(seu$group_use, levels = keep_levels)
+
+# ---------------------------
+# 3. QC as in manuscript
+# ---------------------------
+seu[["percent.mt"]] <- PercentageFeatureSet(seu, pattern = "^mt-|^MT-")
+seu <- subset(seu, subset = nFeature_RNA >= 200)
+
+counts_mat <- GetAssayData(seu, assay = "RNA", slot = "counts")
+keep_genes <- Matrix::rowSums(counts_mat > 0) >= 3
+seu <- subset(seu, features = rownames(seu)[keep_genes])
+
+# ---------------------------
+# 4. Standard Seurat pipeline
+# ---------------------------
+seu <- NormalizeData(seu)
+seu <- FindVariableFeatures(seu)
+seu <- ScaleData(seu, features = rownames(seu), verbose = FALSE)
+seu <- RunPCA(seu, features = VariableFeatures(seu), verbose = FALSE)
+
+npcs_available <- min(50, ncol(Embeddings(seu, "pca")))
+dims_use <- 1:npcs_available
+
+seu <- RunUMAP(seu, reduction = "pca", dims = dims_use)
+seu <- FindNeighbors(seu, dims = dims_use)
+seu <- FindClusters(seu)
+
+saveRDS(seu, file = file.path(output_dir, "seurat_all_hippocampus_processed.rds"))
+
+# ---------------------------
+# 5. Cell-type annotation for Fig. 3b
+# ---------------------------
+candidate_annot_cols <- c(
+  "celltype", "cell_type", "CellType", "annotation", "Annotation",
+  "broad_celltype", "broad_cell_type", "class", "Class", "subclass"
+)
+annot_col <- candidate_annot_cols[candidate_annot_cols %in% colnames(seu@meta.data)][1]
+
+if (length(annot_col) == 0 || is.na(annot_col)) {
+  message("No annotation column found. Generating provisional broad annotation by markers.")
+  marker_list <- list(
+    Excitatory = c("Slc17a7", "Camk2a"),
+    Inhibitory = c("Gad1", "Gad2"),
+    Astrocytes = c("Aldh1l1", "Aqp4", "Gfap"),
+    Oligodendrocytes = c("Mog", "Mbp", "Plp1"),
+    OPCs = c("Pdgfra", "Cspg4"),
+    Microglia = c("Cx3cr1", "P2ry12", "Tmem119"),
+    Endothelial = c("Kdr", "Flt1", "Pecam1")
+  )
+
+  avg_exp <- sapply(marker_list, function(genes) {
+    genes_use <- intersect(genes, rownames(seu))
+    if (length(genes_use) == 0) return(rep(NA_real_, ncol(seu)))
+    Matrix::colMeans(GetAssayData(seu, slot = "data")[genes_use, , drop = FALSE])
+  })
+  avg_exp <- as.data.frame(avg_exp)
+  pred <- apply(avg_exp, 1, function(x) {
+    if (all(is.na(x))) return("Unassigned")
+    names(which.max(x))
+  })
+  seu$celltype_use <- pred
+} else {
+  seu$celltype_use <- seu@meta.data[[annot_col]] |> as.character()
+}
+
+p_umap_all <- DimPlot(
+  seu,
+  reduction = "umap",
+  group.by = "celltype_use",
+  label = TRUE,
+  repel = TRUE,
+  raster = FALSE
+) +
+  labs(title = "Cell-type identification in hippocampus") +
+  theme_classic()
+
+save_pdf(p_umap_all, "Fig3b_UMAP_all_celltypes.pdf", width = 7.2, height = 6)
+write.csv(seu@meta.data, file = file.path(output_dir, "all_cells_metadata.csv"))
+
+# ---------------------------
+# 6. Extract CA1 excitatory neurons (Mpped1 positive)
+# ---------------------------
+exc_idx <- rep(TRUE, ncol(seu))
+if ("celltype_use" %in% colnames(seu@meta.data)) {
+  exc_idx <- grepl("Exc|excit", seu$celltype_use, ignore.case = TRUE)
+}
+seu_exc <- subset(seu, cells = colnames(seu)[exc_idx])
+
+if (!"Mpped1" %in% rownames(seu_exc)) stop("Gene 'Mpped1' not found.")
+mpped1_pos_cells <- colnames(seu_exc)[GetAssayData(seu_exc, slot = "counts")["Mpped1", ] > 0]
+seu_ca1_exc <- subset(seu_exc, cells = mpped1_pos_cells)
+
+candidate_region_cols <- c("region", "Region", "subregion", "Subregion", "area", "Area")
+region_col <- candidate_region_cols[candidate_region_cols %in% colnames(seu_ca1_exc@meta.data)][1]
+if (!is.na(region_col) && length(region_col) > 0) {
+  region_vec <- seu_ca1_exc@meta.data[[region_col]] |> as.character()
+  ca1_idx <- grepl("CA1", region_vec, ignore.case = TRUE)
+  if (sum(ca1_idx) > 0) {
+    seu_ca1_exc <- subset(seu_ca1_exc, cells = colnames(seu_ca1_exc)[ca1_idx])
+  }
+}
+
+seu_ca1_exc <- NormalizeData(seu_ca1_exc)
+seu_ca1_exc <- FindVariableFeatures(seu_ca1_exc)
+seu_ca1_exc <- ScaleData(seu_ca1_exc, features = rownames(seu_ca1_exc), verbose = FALSE)
+seu_ca1_exc <- RunPCA(seu_ca1_exc, features = VariableFeatures(seu_ca1_exc), verbose = FALSE)
+
+npcs_ca1 <- min(50, ncol(Embeddings(seu_ca1_exc, "pca")))
+dims_ca1 <- 1:npcs_ca1
+
+seu_ca1_exc <- RunUMAP(seu_ca1_exc, reduction = "pca", dims = dims_ca1)
+seu_ca1_exc <- FindNeighbors(seu_ca1_exc, dims = dims_ca1)
+seu_ca1_exc <- FindClusters(seu_ca1_exc)
+
+saveRDS(seu_ca1_exc, file = file.path(output_dir, "seurat_CA1_excitatory_Mpped1pos_processed.rds"))
+write.csv(seu_ca1_exc@meta.data, file = file.path(output_dir, "CA1_excitatory_metadata.csv"))
+
+# ---------------------------
+# 7. Fig. 3c: FeaturePlot
+# ---------------------------
+if (!"Grin3a" %in% rownames(seu_ca1_exc)) stop("Gene 'Grin3a' not found.")
+
+p_feature_by_group <- FeaturePlot(
+  seu_ca1_exc,
+  features = "Grin3a",
+  reduction = "umap",
+  split.by = "group_use",
+  cols = c("lightgrey", "red"),
+  raster = FALSE
+) &
+  theme_classic()
+
+save_pdf(p_feature_by_group, "Fig3c_Grin3a_featureplot_split_by_group.pdf", width = 9.5, height = 4.5)
+
+# ---------------------------
+# 8. Fig. 3d: DotPlot
+# ---------------------------
+p_dot <- DotPlot(
+  seu_ca1_exc,
+  features = "Grin3a",
+  group.by = "group_use",
+  cols = c("lightgrey", "red")
+) +
+  theme_classic() +
+  labs(x = NULL, y = NULL, title = "Grin3a expression in CA1 excitatory neurons")
+
+save_pdf(p_dot, "Fig3d_DotPlot_Grin3a_CA1_excitatory.pdf", width = 4.2, height = 4.5)
+
+# ---------------------------
+# 9. Fig. 3e: Violin plot + statistics
+# ---------------------------
+expr_df <- FetchData(seu_ca1_exc, vars = c("Grin3a", "group_use")) %>%
+  as_tibble() %>%
+  mutate(group_use = factor(group_use, levels = c("Control WT", "RSD WT")))
+
+wilcox_res <- wilcox.test(Grin3a ~ group_use, data = expr_df, exact = FALSE)
+
+write.csv(
+  data.frame(
+    comparison = "Control WT vs RSD WT",
+    test = "Wilcoxon rank-sum test",
+    statistic = unname(wilcox_res$statistic),
+    p_value = wilcox_res$p.value,
+    n_cells_control = sum(expr_df$group_use == "Control WT"),
+    n_cells_rsd = sum(expr_df$group_use == "RSD WT")
+  ),
+  file = file.path(output_dir, "Fig3e_statistics.csv"),
+  row.names = FALSE
+)
+
+p_vln <- VlnPlot(
+  seu_ca1_exc,
+  features = "Grin3a",
+  group.by = "group_use",
+  pt.size = 0,
+  cols = c("#4C78A8", "#E45756")
+) +
+  theme_classic() +
+  labs(x = NULL, y = "Normalized expression", title = "Grin3a expression in CA1 excitatory neurons")
+
+save_pdf(p_vln, "Fig3e_Violin_Grin3a_CA1_excitatory.pdf", width = 4.6, height = 4.8)
+
+# ---------------------------
+# 10. Export source data
+# ---------------------------
+write_csv(expr_df, file.path(output_dir, "source_data_Fig3d_e_Grin3a_CA1_excitatory.csv"))
+
+dot_data <- DotPlot(
+  seu_ca1_exc,
+  features = "Grin3a",
+  group.by = "group_use"
+)$data
+write_csv(dot_data, file.path(output_dir, "source_data_Fig3d_dotplot.csv"))
+
+# ---------------------------
+# 11. Session info
+# ---------------------------
+sink(file.path(output_dir, "sessionInfo.txt"))
+sessionInfo()
+sink()
+
+message("Analysis completed successfully.")
+message("Outputs saved to: ", normalizePath(output_dir))
